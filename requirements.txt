@@ -1,0 +1,5 @@
+python-telegram-bot==20.3
+feedparser
+googletrans==4.0.0-rc1
+playwright
+pytz
