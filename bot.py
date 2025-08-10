@@ -8,7 +8,7 @@ import pytz
 
 # === Налаштування ===
 BOT_TOKEN = "8446422482:AAFvjhuxaVVOn5-DJgHMm4xJL9afJ0IMQb8"
-CHANNEL_ID = "@stock_news_ua_bot"  
+CHANNEL_ID = "@t.me/stock_news_ua_bot"  
 NEWS_FEED = "https://finance.yahoo.com/rss/"
 TIMEZONE = "Europe/Kiev"
 
