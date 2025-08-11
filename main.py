@@ -2,17 +2,17 @@ import os, time, html, json, requests, feedparser, sys
 from telegram import Bot, constants
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHANNEL_ID = os.getenv("CHANNEL_ID")  # @назва_каналу або числовий ID
+CHANNEL_ID = os.getenv("CHANNEL_ID")  # @your_channel або числовий ID
 INTERVAL_MIN = int(os.getenv("INTERVAL_MIN", "30"))
 
-# RSS Yahoo Finance для S&P 500 і Nasdaq (можеш змінити)
+# Yahoo Finance RSS для S&P 500 і Nasdaq
 RSS_URLS = [
     "https://finance.yahoo.com/rss/headline?s=%5EGSPC",
     "https://finance.yahoo.com/rss/headline?s=%5EIXIC",
 ]
 
 TRANSLATE_API_URL = os.getenv("TRANSLATE_API_URL", "https://translate.astian.org/translate")
-SEEN_PATH = "seen_ids.json"  # локальний файл для дедуплікації
+SEEN_PATH = "seen_ids.json"  # локальний файл, щоб не дублювати пости
 
 bot = Bot(BOT_TOKEN)
 
