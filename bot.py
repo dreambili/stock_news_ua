@@ -1,65 +1,74 @@
-import asyncio
-import feedparser
+import time
+import requests
+from bs4 import BeautifulSoup
 from googletrans import Translator
-from playwright.async_api import async_playwright
-from datetime import datetime
-from telegram import Bot
-import pytz
+import telebot
 
 # === Налаштування ===
 BOT_TOKEN = "8446422482:AAFvjhuxaVVOn5-DJgHMm4xJL9afJ0IMQb8"
-CHANNEL_ID = "@stock_news_ua_bot"  
-NEWS_FEED = "https://finance.yahoo.com/rss/"
-TIMEZONE = "Europe/Kiev"
+CHANNEL_USERNAME = "@stock_news_ua"
 
-bot = Bot(token=BOT_TOKEN)
+# URL Yahoo Finance для новин про S&P 500, Nasdaq
+NEWS_URLS = [
+    "https://finance.yahoo.com/topic/stock-market-news/",
+    "https://finance.yahoo.com/topic/investing/",
+    "https://finance.yahoo.com/topic/economic-news/"
+]
+
+bot = telebot.TeleBot(BOT_TOKEN)
 translator = Translator()
 
-# === Функція для публікації новин ===
-async def post_news():
-    feed = feedparser.parse(NEWS_FEED)
-    for entry in feed.entries[:5]:
-        translated_title = translator.translate(entry.title, src="en", dest="uk").text
-        message = f"📈 {translated_title}\n🔗 {entry.link}"
-        image_url = None
+last_posted_link = None
+
+def get_latest_news():
+    """Отримує останню новину з Yahoo Finance"""
+    global last_posted_link
+
+    for url in NEWS_URLS:
         try:
-            if hasattr(entry, 'media_content'):
-                image_url = entry.media_content[0]['url']
-        except:
-            pass
-        try:
-            if image_url:
-                await bot.send_photo(chat_id=CHANNEL_ID, photo=image_url, caption=message)
-            else:
-                await bot.send_message(chat_id=CHANNEL_ID, text=message)
+            r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"})
+            soup = BeautifulSoup(r.text, "html.parser")
+
+            article = soup.find("li", {"class": "js-stream-content"})
+            if not article:
+                continue
+
+            link_tag = article.find("a")
+            if not link_tag or not link_tag.get("href"):
+                continue
+
+            link = "https://finance.yahoo.com" + link_tag["href"]
+            title = link_tag.get_text(strip=True)
+
+            if link != last_posted_link:
+                last_posted_link = link
+                return title, link
+
         except Exception as e:
-            print("Помилка надсилання:", e)
+            print(f"Помилка при отриманні новин: {e}")
 
-# === Функція для скріншота Finviz ===
-async def post_finviz_map():
-    url = "https://finviz.com/map.ashx?t=sec&st=w1"
-    async with async_playwright() as p:
-        browser = await p.chromium.launch()
-        page = await browser.new_page()
-        await page.goto(url)
-        await page.screenshot(path="finviz_map.png", full_page=True)
-        await browser.close()
+    return None, None
 
-    await bot.send_photo(chat_id=CHANNEL_ID, photo=open("finviz_map.png", "rb"), caption="🗺 Карта ринку S&P 500")
+def translate_to_ukrainian(text):
+    """Перекладає текст українською"""
+    try:
+        return translator.translate(text, dest="uk").text
+    except:
+        return text
 
-# === Основний цикл ===
-async def main():
-    tz = pytz.timezone(TIMEZONE)
-    while True:
-        now = datetime.now(tz)
-        
-        if now.minute == 0:
-            await post_news()
-
-        if now.hour == 16 and now.minute == 30:
-            await post_finviz_map()
-
-        await asyncio.sleep(60)
+def post_news():
+    """Публікує останню новину в Telegram"""
+    title, link = get_latest_news()
+    if title and link:
+        title_uk = translate_to_ukrainian(title)
+        message = f"📰 {title_uk}\nДжерело: {link}"
+        bot.send_message(CHANNEL_USERNAME, message, disable_web_page_preview=False)
+        print(f"Опубліковано: {title_uk}")
+    else:
+        print("Немає нових новин.")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    print("Бот запущений...")
+    while True:
+        post_news()
+        time.sleep(3600)  # чекати 1 годину
