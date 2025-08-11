@@ -1,14 +1,13 @@
 import time
 import requests
 from bs4 import BeautifulSoup
-from googletrans import Translator
 import telebot
+import sys
 
 # === Налаштування ===
 BOT_TOKEN = "8446422482:AAFvjhuxaVVOn5-DJgHMm4xJL9afJ0IMQb8"
 CHANNEL_USERNAME = "@stock_news_ua"
 
-# URL Yahoo Finance для новин про S&P 500, Nasdaq
 NEWS_URLS = [
     "https://finance.yahoo.com/topic/stock-market-news/",
     "https://finance.yahoo.com/topic/investing/",
@@ -16,17 +15,14 @@ NEWS_URLS = [
 ]
 
 bot = telebot.TeleBot(BOT_TOKEN)
-translator = Translator()
-
 last_posted_link = None
 
 def get_latest_news():
-    """Отримує останню новину з Yahoo Finance"""
     global last_posted_link
 
     for url in NEWS_URLS:
         try:
-            r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"})
+            r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
             soup = BeautifulSoup(r.text, "html.parser")
 
             article = soup.find("li", {"class": "js-stream-content"})
@@ -45,30 +41,24 @@ def get_latest_news():
                 return title, link
 
         except Exception as e:
-            print(f"Помилка при отриманні новин: {e}")
+            print(f"[ERROR] Помилка при отриманні новин: {e}", file=sys.stderr)
 
     return None, None
 
-def translate_to_ukrainian(text):
-    """Перекладає текст українською"""
-    try:
-        return translator.translate(text, dest="uk").text
-    except:
-        return text
-
 def post_news():
-    """Публікує останню новину в Telegram"""
     title, link = get_latest_news()
     if title and link:
-        title_uk = translate_to_ukrainian(title)
-        message = f"📰 {title_uk}\nДжерело: {link}"
-        bot.send_message(CHANNEL_USERNAME, message, disable_web_page_preview=False)
-        print(f"Опубліковано: {title_uk}")
+        message = f"📰 {title}\nДжерело: {link}"
+        try:
+            bot.send_message(CHANNEL_USERNAME, message, disable_web_page_preview=False)
+            print(f"[INFO] Опубліковано: {title}")
+        except Exception as e:
+            print(f"[ERROR] Помилка надсилання в Telegram: {e}", file=sys.stderr)
     else:
-        print("Немає нових новин.")
+        print("[INFO] Нових новин немає.")
 
 if __name__ == "__main__":
-    print("Бот запущений...")
+    print("[INFO] Бот запущений...")
     while True:
         post_news()
         time.sleep(3600)  # чекати 1 годину
