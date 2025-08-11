@@ -1,16 +1,24 @@
 import os
+import sys
 import time
 import threading
 import requests
 from bs4 import BeautifulSoup
 import telebot
 from flask import Flask
+from googletrans import Translator
 
 # =====================
 #   НАЛАШТУВАННЯ
 # =====================
-BOT_TOKEN = "8446422482:AAFvjhuxaVVOn5-DJgHMm4xJL9afJ0IMQb8"  # РЕКОМЕНДУЮ замінити на новий токен!
-CHANNEL_USERNAME = "@stock_news_ua"
+# ⚠️ Беремо токен із змінної середовища (НЕ з коду)
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+if not BOT_TOKEN:
+    print("[FATAL] Не задано змінну середовища BOT_TOKEN. Додай її в Render → Environment.")
+    sys.exit(1)
+
+# Канал можна задати тут, або через змінну середовища CHANNEL_USERNAME
+CHANNEL_USERNAME = os.environ.get("CHANNEL_USERNAME", "@stock_news_ua")
 
 # Сторінки Yahoo Finance з новинами
 NEWS_URLS = [
@@ -20,6 +28,7 @@ NEWS_URLS = [
 ]
 
 bot = telebot.TeleBot(BOT_TOKEN)
+translator = Translator()
 last_posted_link_path = "last_posted.txt"
 
 
@@ -43,10 +52,12 @@ last_posted_link = _read_last_link()
 
 
 def get_latest_news():
-    """Отримує останню новину з Yahoo Finance"""
+    """Отримує (title, link) останньої новини з будь-якого з розділів."""
     headers = {
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                      "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+        )
     }
     for url in NEWS_URLS:
         try:
@@ -54,12 +65,13 @@ def get_latest_news():
             r.raise_for_status()
             soup = BeautifulSoup(r.text, "html.parser")
 
-            # Пошук першого посилання на новину
+            # 1) спроба: стандартний елемент стрічки
             link_tag = None
             li = soup.find("li", {"class": "js-stream-content"})
             if li:
                 link_tag = li.find("a", href=True)
 
+            # 2) запасний варіант: перший лінк, що веде на /news/
             if not link_tag:
                 for a in soup.select("a[href]"):
                     href = a.get("href", "")
@@ -71,14 +83,11 @@ def get_latest_news():
                 continue
 
             href = link_tag.get("href", "")
-            if href.startswith("http"):
-                link = href
-            else:
-                link = "https://finance.yahoo.com" + href
+            link = href if href.startswith("http") else "https://finance.yahoo.com" + href
 
             title = (link_tag.get_text() or "").strip()
-            if not title:
-                h = li.find(["h3", "h2"]) if li else None
+            if not title and li:
+                h = li.find(["h3", "h2"])
                 if h:
                     title = h.get_text(strip=True)
 
@@ -92,7 +101,7 @@ def get_latest_news():
 
 
 def post_one_news_if_new():
-    """Публікує новину, якщо вона нова"""
+    """Перекладає та публікує новину, якщо вона нова (1 шт)."""
     global last_posted_link
     title, link = get_latest_news()
     if not title or not link:
@@ -103,18 +112,25 @@ def post_one_news_if_new():
         print("[INFO] Остання новина вже публікувалась.")
         return
 
-    msg = f"📰 {title}\nДжерело: {link}"
+    # Переклад заголовка на українську
+    title_uk = title
+    try:
+        title_uk = translator.translate(title, dest="uk").text
+    except Exception as e:
+        print(f"[WARN] Переклад не вдався, публікуємо оригінал: {e}")
+
+    msg = f"📰 {title_uk}\n🔗 Джерело: {link}"
 
     try:
         bot.send_message(CHANNEL_USERNAME, msg, disable_web_page_preview=False)
-        print(f"[INFO] Опубліковано: {title}")
+        print(f"[INFO] Опубліковано: {title_uk}")
         last_posted_link = link
         _save_last_link(link)
     except Exception as e:
         print(f"[ERROR] Відправка в Telegram: {e}")
 
 
-# Flask-сервер для Render
+# Flask-заглушка для Render (щоб сервіс бачив відкритий порт)
 app = Flask(__name__)
 
 @app.route('/')
@@ -126,12 +142,11 @@ def run_flask():
     app.run(host="0.0.0.0", port=port, threaded=True)
 
 
-# Основний цикл
 def main_loop():
     print("[INFO] Бот запущений. Кожну годину перевіряємо новини...")
     post_one_news_if_new()  # одразу при старті
     while True:
-        time.sleep(3600)  # чекати 1 годину
+        time.sleep(3600)  # 1 година
         post_one_news_if_new()
 
 
