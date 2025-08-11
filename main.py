@@ -1,64 +1,80 @@
-import os, time, html, hashlib, requests, feedparser
-from fastapi import FastAPI
-from deta import Deta
+import os, time, html, json, requests, feedparser, sys
+from telegram import Bot, constants
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHANNEL_ID = os.getenv("CHANNEL_ID")
+CHANNEL_ID = os.getenv("CHANNEL_ID")  # @назва_каналу або числовий ID
+INTERVAL_MIN = int(os.getenv("INTERVAL_MIN", "30"))
+
+# RSS Yahoo Finance для S&P 500 і Nasdaq (можеш змінити)
 RSS_URLS = [
-    "http://finance.yahoo.com/rss/headline?s=%5EGSPC",
-    "http://finance.yahoo.com/rss/headline?s=%5EIXIC"
+    "https://finance.yahoo.com/rss/headline?s=%5EGSPC",
+    "https://finance.yahoo.com/rss/headline?s=%5EIXIC",
 ]
+
 TRANSLATE_API_URL = os.getenv("TRANSLATE_API_URL", "https://translate.astian.org/translate")
+SEEN_PATH = "seen_ids.json"  # локальний файл для дедуплікації
 
-app = FastAPI()
-deta = Deta()
-db = deta.Base("seen_ids")
+bot = Bot(BOT_TOKEN)
 
-def _hash(s: str) -> str:
-    return hashlib.sha1(s.encode("utf-8")).hexdigest()
+def log(*a): print(*a, file=sys.stdout, flush=True)
+
+def load_seen():
+    try:
+        with open(SEEN_PATH, "r", encoding="utf-8") as f:
+            return set(json.load(f))
+    except:
+        return set()
+
+def save_seen(seen):
+    with open(SEEN_PATH, "w", encoding="utf-8") as f:
+        json.dump(sorted(list(seen)), f)
 
 def translate_uk(text: str) -> str:
     try:
-        r = requests.post(TRANSLATE_API_URL, timeout=15,
-                          json={"q": text, "source": "en", "target": "uk", "format": "text"})
+        r = requests.post(
+            TRANSLATE_API_URL, timeout=15,
+            json={"q": text, "source": "en", "target": "uk", "format": "text"}
+        )
         r.raise_for_status()
         return r.json().get("translatedText") or text
-    except:
+    except Exception as e:
+        log("translate error:", e)
         return text
 
-def send_telegram(text: str):
-    requests.post(
-        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-        data={"chat_id": CHANNEL_ID, "text": text, "parse_mode": "HTML"},
-        timeout=15
+def post_message(title_en: str, link: str):
+    title_uk = translate_uk(title_en)
+    text = f"<b>{html.escape(title_uk)}</b>\n{html.escape(link)}"
+    bot.send_message(
+        chat_id=CHANNEL_ID,
+        text=text,
+        parse_mode=constants.ParseMode.HTML,
+        disable_web_page_preview=False
     )
 
-def post_new_items(limit=5):
+def fetch_and_post():
+    seen = load_seen()
     posted = 0
-    for url in RSS_URLS:
-        feed = feedparser.parse(url)
-        for e in feed.entries[:limit]:
-            title, link = e.get("title",""), e.get("link","")
+    for rss in RSS_URLS:
+        feed = feedparser.parse(rss)
+        for e in feed.entries:
+            title = e.get("title", "").strip()
+            link = e.get("link", "").strip()
             if not title or not link:
                 continue
-            key = _hash(link)
-            if db.get(key):
+            key = link  # достатньо унікально
+            if key in seen:
                 continue
-            msg = f"<b>{html.escape(translate_uk(title))}</b>\n{html.escape(link)}"
-            send_telegram(msg)
-            db.put({"key": key})
+            post_message(title, link)
+            seen.add(key); save_seen(seen)
             posted += 1
             time.sleep(1)
-    return posted
+    log(f"posted {posted} items")
 
-@app.get("/")
-def health():
-    return {"ok": True}
-
-@app.get("/run")
-def run():
-    try:
-        n = post_new_items()
-        return {"status": "ok", "posted": n}
-    except Exception as e:
-        return {"status": "error", "detail": str(e)}
+if __name__ == "__main__":
+    log("worker started")
+    while True:
+        try:
+            fetch_and_post()
+        except Exception as e:
+            log("cycle error:", e)
+        time.sleep(INTERVAL_MIN * 60)
