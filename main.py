@@ -6,7 +6,7 @@ import feedparser
 import requests
 from flask import Flask, jsonify
 
-# ==== ENV ====
+# ========= ENV =========
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()  # @channel або -100XXXXXXXXXX
 TRANSLATE_API_URL = os.getenv("TRANSLATE_API_URL", "").strip()  # напр.: https://translate.astian.org/translate
@@ -18,13 +18,14 @@ DEFAULT_FEEDS = [
 ]
 FEEDS = [x.strip() for x in os.getenv("SOURCE_FEEDS", ",".join(DEFAULT_FEEDS)).split(",") if x.strip()]
 
-# Файли локального стану (переживуть «сон» інстансу, але не повний redeploy)
+# ========= STATE FILES (переживають «сон», але не повний redeploy) =========
 LAST_RUN_FILE = "last_run.json"
 POSTED_FILE = "posted_ids.json"
 
+# ========= APP =========
 app = Flask(__name__)
 
-# ==== helpers ====
+# ========= HELPERS =========
 def _load_json(path: str, default):
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -52,46 +53,48 @@ def mark_ran_now():
 def get_posted_set() -> set:
     return set(_load_json(POSTED_FILE, {"ids": []}).get("ids", []))
 
-def remember_posted(ids: List[str], keep: int = 600):
+def remember_posted(ids: List[str], keep: int = 800):
     s = list(get_posted_set())
     s.extend(ids)
     s = s[-keep:]
     _save_json(POSTED_FILE, {"ids": s})
 
-# ---- переклад EN->UK з фолбеком ----
+# ========= TRANSLATION (EN -> UK) =========
+def _translate_call(url: str, text: str) -> str | None:
+    """Low-level виклик LibreTranslate-сумісного API."""
+    try:
+        r = requests.post(
+            url,
+            json={"q": text, "source": "en", "target": "uk", "format": "text"},
+            timeout=12,
+            headers={"Accept": "application/json"},
+        )
+        if r.ok:
+            j = r.json()
+            t = j.get("translatedText")
+            if isinstance(t, str) and t.strip():
+                return t
+        else:
+            print(f"[WARN] translate API {url} -> {r.status_code}: {r.text[:160]}")
+    except Exception as e:
+        print(f"[ERROR] translate API {url} failed: {e}")
+    return None
+
 def translate_to_uk(text: str) -> str:
+    """Основний endpoint з ENV + fallback на публічний."""
     if not text:
         return text
-
-    def _call(url: str) -> str | None:
-        try:
-            r = requests.post(
-                url,
-                json={"q": text, "source": "en", "target": "uk", "format": "text"},
-                timeout=12,
-                headers={"Accept": "application/json"},
-            )
-            if r.ok:
-                j = r.json()
-                t = j.get("translatedText")
-                if isinstance(t, str) and t.strip():
-                    return t
-        except Exception:
-            pass
-        return None
-
-    api = TRANSLATE_API_URL
-    if api:
-        out = _call(api)
+    # 1) основний
+    if TRANSLATE_API_URL:
+        out = _translate_call(TRANSLATE_API_URL, text)
         if out:
             return out
-
-    # Публічний фолбек, якщо твій endpoint недоступний
-    out = _call("https://libretranslate.de/translate")
+    # 2) fallback
+    out = _translate_call("https://libretranslate.de/translate", text)
     return out or text
 
-# ---- RSS ----
-def fetch_articles(feeds: List[str], limit: int = 100) -> List[Dict]:
+# ========= RSS =========
+def fetch_articles(feeds: List[str], limit: int = 120) -> List[Dict]:
     items, seen = [], set()
     for url in feeds:
         try:
@@ -107,13 +110,14 @@ def fetch_articles(feeds: List[str], limit: int = 100) -> List[Dict]:
                     continue
                 seen.add(key)
                 items.append({"title": title, "link": link, "key": key})
-        except Exception:
+        except Exception as e:
+            print(f"[WARN] RSS parse failed for {url}: {e}")
             continue
         if len(items) >= limit:
             break
     return items
 
-# ---- Telegram ----
+# ========= TELEGRAM =========
 def send_to_telegram(text: str):
     if not BOT_TOKEN or not CHANNEL_ID:
         raise RuntimeError("BOT_TOKEN або CHANNEL_ID не задані в Environment")
@@ -122,7 +126,7 @@ def send_to_telegram(text: str):
         "chat_id": CHANNEL_ID,
         "text": text,
         "parse_mode": "HTML",
-        "disable_web_page_preview": False,  # картка-прев'ю УВІМКНЕНА
+        "disable_web_page_preview": False,  # увімкнене прев'ю картки
     }
     r = requests.post(url, json=payload, timeout=15)
     r.raise_for_status()
@@ -130,10 +134,9 @@ def send_to_telegram(text: str):
 def compose_message(item: Dict) -> str:
     title_uk = translate_to_uk(item["title"])
     link = item["link"]
-    # Формат: 1-й рядок — заголовок УКР, 2-й — лінк
     return f"{title_uk}\n{link}" if link else title_uk
 
-# ==== routes ====
+# ========= ROUTES =========
 @app.get("/")
 def health():
     return jsonify({"ok": True})
@@ -149,7 +152,7 @@ def diag():
 
 @app.get("/run")
 def run_job():
-    # 1) Обмеження частоти
+    # 1) Ліміт частоти
     if not should_run_every_2h():
         return jsonify({"status": "skip", "reason": "less than 2h since last run"})
 
@@ -177,8 +180,8 @@ def run_job():
             send_to_telegram(compose_message(it))
             sent += 1
             time.sleep(0.7)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[ERROR] telegram send failed: {e}")
 
     # 4) Стан
     if sent:
