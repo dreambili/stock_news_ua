@@ -1,4 +1,4 @@
-import os, json, time, hashlib
+import os, json, time, hashlib, threading
 from datetime import datetime, timezone
 from typing import List, Dict
 
@@ -6,12 +6,13 @@ import feedparser
 import requests
 from flask import Flask, jsonify, request
 
-# ===== ENV =====
+# -------------------- ENV --------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()  # @channel або -100XXXXXXXXXX
-TRANSLATE_API_URL = os.getenv("TRANSLATE_API_URL", "").strip()  # наприклад: https://<твій>.onrender.com/translate
-FORCE_KEY = os.getenv("FORCE_KEY", "letmein")  # секрет для /force
+CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()              # @channel або -100XXXXXXXXXX
+TRANSLATE_API_URL = os.getenv("TRANSLATE_API_URL", "").strip()# https://<твій-libretranslate>.onrender.com/translate
+FORCE_KEY = os.getenv("FORCE_KEY", "letmein")                  # секрет для /force (опціонально)
 
+# Джерела (можеш змінювати через ENV SOURCE_FEEDS, через кому)
 DEFAULT_FEEDS = [
     "https://feeds.finance.yahoo.com/rss/2.0/headline?s=^GSPC,^IXIC,^DJI&region=US&lang=en-US",
     "https://www.investing.com/rss/news_25.rss",
@@ -19,13 +20,16 @@ DEFAULT_FEEDS = [
 ]
 FEEDS = [x.strip() for x in os.getenv("SOURCE_FEEDS", ",".join(DEFAULT_FEEDS)).split(",") if x.strip()]
 
-# ===== STATE FILES (переживають сон інстансу) =====
+# Файли для стану (щоб не було дублів і дотримувався інтервал)
 LAST_RUN_FILE = "last_run.json"
 POSTED_FILE   = "posted_ids.json"
 
+# Захист від паралельних запусків (коли uptime-бот або браузер тисне кілька разів)
+RUN_LOCK = threading.Lock()
+
 app = Flask(__name__)
 
-# ===== helpers =====
+# -------------------- helpers --------------------
 def _load_json(path: str, default):
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -53,37 +57,54 @@ def mark_ran_now():
 def get_posted_set() -> set:
     return set(_load_json(POSTED_FILE, {"ids": []}).get("ids", []))
 
-def remember_posted(ids: List[str], keep: int = 800):
+def remember_posted(ids: List[str], keep: int = 1000):
     s = list(get_posted_set())
     s.extend(ids)
+    # обмежимо розмір, щоб файл не ріс безкінечно
     s = s[-keep:]
     _save_json(POSTED_FILE, {"ids": s})
 
-# ===== translation: ONLY your endpoint, no external fallbacks =====
-def translate_to_uk(text: str) -> str:
-    if not text:
-        return text
+# -------------------- translation (тільки твій інстанс) --------------------
+def warmup_translator():
+    """Швидкий пінг, щоб розбудити інстанс після сну Free-тарифу."""
     if not TRANSLATE_API_URL:
-        return text
+        return
     try:
-        r = requests.post(
-            TRANSLATE_API_URL,
-            json={"q": text, "source": "en", "target": "uk", "format": "text"},
-            timeout=20,
-            headers={"Accept": "application/json", "User-Agent": "stock_news_ua/1.0"},
-        )
-        r.raise_for_status()
-        data = r.json()
-        t = data.get("translatedText")
-        if isinstance(t, str) and t.strip():
-            return t
-        print(f"[WARN] translate empty translatedText from {TRANSLATE_API_URL}: {data}")
-        return text
+        base = TRANSLATE_API_URL.rsplit("/translate", 1)[0]
+        requests.get(f"{base}/languages", timeout=10)
     except Exception as e:
-        print(f"[ERROR] translate failed via {TRANSLATE_API_URL}: {e}")
-        return text  # не валимося, просто віддамо англ. заголовок
+        print(f"[WARN] warmup translator failed: {e}")
 
-# ===== RSS =====
+warmup_translator()
+
+def translate_to_uk(text: str) -> str:
+    if not text or not TRANSLATE_API_URL:
+        return text
+
+    payload = {"q": text, "source": "en", "target": "uk", "format": "text"}
+    # 3 спроби з довшим таймаутом — бо інстанс може «прокидатись»
+    timeouts = [20, 35, 50]
+    for i, to in enumerate(timeouts, 1):
+        try:
+            r = requests.post(
+                TRANSLATE_API_URL,
+                json=payload,
+                timeout=to,
+                headers={"Accept": "application/json", "User-Agent": "stock_news_ua/1.0"},
+            )
+            r.raise_for_status()
+            data = r.json()
+            t = data.get("translatedText")
+            if isinstance(t, str) and t.strip():
+                return t
+            print(f"[WARN] translate (try {i}) empty translatedText: {data}")
+        except Exception as e:
+            print(f"[WARN] translate (try {i}) failed: {e}")
+        time.sleep(2 + i)
+    # якщо не вдалось — не ламаємось, повернемо оригінал
+    return text
+
+# -------------------- RSS --------------------
 def fetch_articles(feeds: List[str], limit: int = 120) -> List[Dict]:
     items, seen = [], set()
     for url in feeds:
@@ -106,7 +127,7 @@ def fetch_articles(feeds: List[str], limit: int = 120) -> List[Dict]:
             break
     return items
 
-# ===== Telegram =====
+# -------------------- Telegram --------------------
 def send_to_telegram(text: str):
     if not BOT_TOKEN or not CHANNEL_ID:
         raise RuntimeError("BOT_TOKEN або CHANNEL_ID не задані в Environment")
@@ -115,9 +136,9 @@ def send_to_telegram(text: str):
         "chat_id": CHANNEL_ID,
         "text": text,
         "parse_mode": "HTML",
-        "disable_web_page_preview": False,  # картка-прев'ю увімкнена
+        "disable_web_page_preview": False,  # вмикаємо прев’ю лінка
     }
-    r = requests.post(url, json=payload, timeout=15)
+    r = requests.post(url, json=payload, timeout=20)
     r.raise_for_status()
 
 def compose_message(item: Dict) -> str:
@@ -125,7 +146,7 @@ def compose_message(item: Dict) -> str:
     link = item["link"]
     return f"{title_uk}\n{link}" if link else title_uk
 
-# ===== routes =====
+# -------------------- Flask routes --------------------
 @app.get("/")
 def health():
     return jsonify({"ok": True})
@@ -143,19 +164,30 @@ def diag():
 
 @app.get("/run")
 def run_job():
-    if not should_run_every_2h():
-        return jsonify({"status": "skip", "reason": "less than 2h since last run"})
-    return _do_post_cycle()
+    # один запуск за раз
+    if not RUN_LOCK.acquire(blocking=False):
+        return jsonify({"status": "skip", "reason": "another run in progress"})
+    try:
+        if not should_run_every_2h():
+            return jsonify({"status": "skip", "reason": "less than 2h since last run"})
+        return _do_post_cycle()
+    finally:
+        RUN_LOCK.release()
 
 @app.get("/force")
 def force_job():
-    # тестовий запуск без ліміту 2 год
+    # тест без обмеження 2 год (захищено секретом)
     if request.args.get("key") != FORCE_KEY:
         return jsonify({"error": "forbidden"}), 403
-    return _do_post_cycle()
+    if not RUN_LOCK.acquire(blocking=False):
+        return jsonify({"status": "skip", "reason": "another run in progress"})
+    try:
+        return _do_post_cycle()
+    finally:
+        RUN_LOCK.release()
 
 def _do_post_cycle():
-    items = fetch_articles(FEEDS, limit=120)
+    items = fetch_articles(FEEDS, limit=200)
     posted = get_posted_set()
 
     to_post, new_ids = [], []
@@ -164,12 +196,8 @@ def _do_post_cycle():
             continue
         to_post.append(it)
         new_ids.append(it["key"])
-        if len(to_post) == 3:  # рівно 3 за запуск
+        if len(to_post) == 3:  # РІВНО 3 ЗА ЗАПУСК
             break
-
-    if not to_post:
-        mark_ran_now()
-        return jsonify({"status": "ok", "posted": 0, "note": "no new items"})
 
     sent = 0
     for it in to_post:
@@ -182,5 +210,7 @@ def _do_post_cycle():
 
     if sent:
         remember_posted(new_ids[:sent])
+
+    # позначимо момент запуску (щоб /run не постив частіше ніж раз/2h)
     mark_ran_now()
-    return jsonify({"status": "ok", "posted": sent})
+    return jsonify({"status": "ok", "posted": sent, "skipped": len(to_post) - sent, "total_new_seen": len(new_ids)})
