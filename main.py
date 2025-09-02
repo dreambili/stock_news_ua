@@ -4,12 +4,13 @@ from typing import List, Dict
 
 import feedparser
 import requests
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 
-# ============ ENV ============
+# ===== ENV =====
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()  # @channel або -100xxxxxxxxxx
-ENV_TRANSLATE = os.getenv("TRANSLATE_API_URL", "").strip()  # напр.: https://translate.argosopentech.com/translate
+CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()  # @channel або -100XXXXXXXXXX
+TRANSLATE_API_URL = os.getenv("TRANSLATE_API_URL", "").strip()  # наприклад: https://<твій>.onrender.com/translate
+FORCE_KEY = os.getenv("FORCE_KEY", "letmein")  # секрет для /force
 
 DEFAULT_FEEDS = [
     "https://feeds.finance.yahoo.com/rss/2.0/headline?s=^GSPC,^IXIC,^DJI&region=US&lang=en-US",
@@ -18,14 +19,13 @@ DEFAULT_FEEDS = [
 ]
 FEEDS = [x.strip() for x in os.getenv("SOURCE_FEEDS", ",".join(DEFAULT_FEEDS)).split(",") if x.strip()]
 
-# ============ STATE FILES ============
+# ===== STATE FILES (переживають сон інстансу) =====
 LAST_RUN_FILE = "last_run.json"
-POSTED_FILE = "posted_ids.json"
+POSTED_FILE   = "posted_ids.json"
 
-# ============ APP ============
 app = Flask(__name__)
 
-# ============ HELPERS ============
+# ===== helpers =====
 def _load_json(path: str, default):
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -59,50 +59,31 @@ def remember_posted(ids: List[str], keep: int = 800):
     s = s[-keep:]
     _save_json(POSTED_FILE, {"ids": s})
 
-# ============ TRANSLATION (EN -> UK) ============
-def _translate_call(url: str, text: str) -> str | None:
-    """Виклик LibreTranslate-сумісного API. Повертає переклад або None."""
-    try:
-        r = requests.post(
-            url,
-            json={"q": text, "source": "en", "target": "uk", "format": "text"},
-            timeout=12,
-            headers={"Accept": "application/json", "User-Agent": "stock_news_ua/1.0"},
-        )
-        if r.ok:
-            try:
-                j = r.json()
-            except Exception:
-                print(f"[WARN] translate API {url} non-JSON: {r.text[:160]}")
-                return None
-            t = j.get("translatedText")
-            if isinstance(t, str) and t.strip():
-                return t
-            print(f"[WARN] translate API {url} empty translatedText")
-        else:
-            print(f"[WARN] translate API {url} -> {r.status_code}: {r.text[:160]}")
-    except Exception as e:
-        print(f"[ERROR] translate API {url} failed: {e}")
-    return None
-
-# порядок спроб: ENV → Argos → LibreTranslate.de → Astian
-TRANSLATE_ENDPOINTS = [e for e in [
-    ENV_TRANSLATE or None,
-    "https://translate.argosopentech.com/translate",
-    "https://libretranslate.de/translate",
-    "https://translate.astian.org/translate",
-] if e]
-
+# ===== translation: ONLY your endpoint, no external fallbacks =====
 def translate_to_uk(text: str) -> str:
     if not text:
         return text
-    for ep in TRANSLATE_ENDPOINTS:
-        res = _translate_call(ep, text)
-        if res:
-            return res
-    return text  # якщо все впало — повертаємо оригінал
+    if not TRANSLATE_API_URL:
+        return text
+    try:
+        r = requests.post(
+            TRANSLATE_API_URL,
+            json={"q": text, "source": "en", "target": "uk", "format": "text"},
+            timeout=20,
+            headers={"Accept": "application/json", "User-Agent": "stock_news_ua/1.0"},
+        )
+        r.raise_for_status()
+        data = r.json()
+        t = data.get("translatedText")
+        if isinstance(t, str) and t.strip():
+            return t
+        print(f"[WARN] translate empty translatedText from {TRANSLATE_API_URL}: {data}")
+        return text
+    except Exception as e:
+        print(f"[ERROR] translate failed via {TRANSLATE_API_URL}: {e}")
+        return text  # не валимося, просто віддамо англ. заголовок
 
-# ============ RSS ============
+# ===== RSS =====
 def fetch_articles(feeds: List[str], limit: int = 120) -> List[Dict]:
     items, seen = [], set()
     for url in feeds:
@@ -110,7 +91,7 @@ def fetch_articles(feeds: List[str], limit: int = 120) -> List[Dict]:
             parsed = feedparser.parse(url)
             for e in parsed.entries:
                 title = (e.get("title") or "").strip()
-                link = (e.get("link") or "").strip()
+                link  = (e.get("link") or "").strip()
                 key_src = link or title
                 if not key_src:
                     continue
@@ -119,14 +100,13 @@ def fetch_articles(feeds: List[str], limit: int = 120) -> List[Dict]:
                     continue
                 seen.add(key)
                 items.append({"title": title, "link": link, "key": key})
-        except Exception as e:
-            print(f"[WARN] RSS parse failed for {url}: {e}")
-            continue
+        except Exception as ex:
+            print(f"[WARN] RSS parse failed for {url}: {ex}")
         if len(items) >= limit:
             break
     return items
 
-# ============ TELEGRAM ============
+# ===== Telegram =====
 def send_to_telegram(text: str):
     if not BOT_TOKEN or not CHANNEL_ID:
         raise RuntimeError("BOT_TOKEN або CHANNEL_ID не задані в Environment")
@@ -135,7 +115,7 @@ def send_to_telegram(text: str):
         "chat_id": CHANNEL_ID,
         "text": text,
         "parse_mode": "HTML",
-        "disable_web_page_preview": False,  # увімкнене прев'ю картки
+        "disable_web_page_preview": False,  # картка-прев'ю увімкнена
     }
     r = requests.post(url, json=payload, timeout=15)
     r.raise_for_status()
@@ -145,7 +125,7 @@ def compose_message(item: Dict) -> str:
     link = item["link"]
     return f"{title_uk}\n{link}" if link else title_uk
 
-# ============ ROUTES ============
+# ===== routes =====
 @app.get("/")
 def health():
     return jsonify({"ok": True})
@@ -154,7 +134,7 @@ def health():
 def diag():
     return jsonify({
         "feeds": FEEDS,
-        "translate_endpoints": TRANSLATE_ENDPOINTS,
+        "translate_api_url": TRANSLATE_API_URL,
         "has_bot": bool(BOT_TOKEN),
         "has_channel": bool(CHANNEL_ID),
         "last_run": _load_json(LAST_RUN_FILE, {"last": 0}).get("last", 0),
@@ -163,11 +143,18 @@ def diag():
 
 @app.get("/run")
 def run_job():
-    # 1) частота
     if not should_run_every_2h():
         return jsonify({"status": "skip", "reason": "less than 2h since last run"})
+    return _do_post_cycle()
 
-    # 2) збір новин
+@app.get("/force")
+def force_job():
+    # тестовий запуск без ліміту 2 год
+    if request.args.get("key") != FORCE_KEY:
+        return jsonify({"error": "forbidden"}), 403
+    return _do_post_cycle()
+
+def _do_post_cycle():
     items = fetch_articles(FEEDS, limit=120)
     posted = get_posted_set()
 
@@ -184,7 +171,6 @@ def run_job():
         mark_ran_now()
         return jsonify({"status": "ok", "posted": 0, "note": "no new items"})
 
-    # 3) відправка
     sent = 0
     for it in to_post:
         try:
@@ -194,9 +180,7 @@ def run_job():
         except Exception as e:
             print(f"[ERROR] telegram send failed: {e}")
 
-    # 4) стан
     if sent:
         remember_posted(new_ids[:sent])
     mark_ran_now()
-
     return jsonify({"status": "ok", "posted": sent})
