@@ -1,83 +1,210 @@
-import os, time, html, hashlib, requests, feedparser, sys
-from fastapi import FastAPI
+import os
+import sys
+import time
+import json
+import logging
+import threading
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHANNEL_ID = os.getenv("CHANNEL_ID")
+import feedparser
+import telebot
+from flask import Flask
+from googletrans import Translator
 
-RSS_URLS = [
-    "https://finance.yahoo.com/rss/headline?s=%5EGSPC",  # S&P 500
-    "https://finance.yahoo.com/rss/headline?s=%5EIXIC",  # Nasdaq
+# =========================
+#        НАЛАШТУВАННЯ
+# =========================
+# ⚠️ Токен беремо зі змінної середовища (Render → Settings → Environment)
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+if not BOT_TOKEN:
+    print("[FATAL] Не задано змінну середовища BOT_TOKEN. Додай її у Render → Environment.")
+    sys.exit(1)
+
+# Канал можна теж винести у змінну середовища CHANNEL_USERNAME; за замовчуванням — твій канал
+CHANNEL_USERNAME = os.environ.get("CHANNEL_USERNAME", "@stock_news_ua")
+
+# RSS-стрічки Yahoo Finance (широке покриття ринку: S&P500, Nasdaq, акції)
+FEEDS = [
+    "https://feeds.finance.yahoo.com/rss/2.0/headline?lang=en-US&region=US",
+    # Можеш додати додаткові RSS сюди
 ]
 
-LT_URL = os.getenv("TRANSLATE_API_URL", "https://translate.astian.org/translate")
+# Скільки новин публікувати за один запуск (раз на 2 години)
+BATCH_SIZE = 3
 
-app = FastAPI()
-seen = set()
+# Куди записуємо опубліковані посилання (щоб не дублювати)
+HISTORY_FILE = "posted_links.json"
+HISTORY_LIMIT = 300  # зберігати останні 300 посилань
 
-def log(*a): print(*a, file=sys.stdout, flush=True)
-def h(s: str) -> str: return hashlib.sha1(s.encode()).hexdigest()
+# Логування
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+log = logging.getLogger("stock_news_ua")
 
-def lt_translate(text: str) -> str:
-    r = requests.post(LT_URL, timeout=12,
-        json={"q": text, "source": "en", "target": "uk", "format": "text"})
-    r.raise_for_status()
-    return r.json().get("translatedText") or text
+# Ініціалізація Telegram та перекладача
+bot = telebot.TeleBot(BOT_TOKEN)
+translator = Translator()
 
-def mymemory_translate(text: str) -> str:
-    r = requests.get(
-        "https://api.mymemory.translated.net/get",
-        params={"q": text, "langpair": "en|uk"},
-        timeout=10
-    )
-    r.raise_for_status()
-    data = r.json()
-    return (data.get("responseData") or {}).get("translatedText") or text
-
-def translate_uk(text: str) -> str:
+# =========================
+#     ДОПОМОЖНІ ФУНКЦІЇ
+# =========================
+def load_history():
+    """Зчитуємо список опублікованих посилань з файлу."""
     try:
-        t = lt_translate(text)
-        if t and t.strip().lower() != text.strip().lower():
-            return t
-        # якщо LibreTranslate повернув оригінал, пробуємо fallback
-        raise RuntimeError("LT returned original")
+        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return set(data if isinstance(data, list) else [])
+    except FileNotFoundError:
+        return set()
     except Exception as e:
-        log("LT fail:", e)
+        log.warning(f"Не вдалося прочитати історію ({HISTORY_FILE}): {e}")
+        return set()
+
+def save_history(link_set):
+    """Зберігаємо історію посилань у файл (обмежуємо до HISTORY_LIMIT)."""
+    try:
+        arr = list(link_set)
+        if len(arr) > HISTORY_LIMIT:
+            arr = arr[-HISTORY_LIMIT:]
+        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(arr, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log.warning(f"Не вдалося зберегти історію ({HISTORY_FILE}): {e}")
+
+POSTED = load_history()
+
+def fetch_entries_from_feeds(max_items=10):
+    """Збирає останні записи з RSS-стрічок та повертає відсортований список (найновіші першими)."""
+    entries = []
+    for url in FEEDS:
         try:
-            t2 = mymemory_translate(text)
-            return t2 or text
-        except Exception as e2:
-            log("MyMemory fail:", e2)
-            return text
+            feed = feedparser.parse(url)
+            if feed.bozo:
+                log.warning(f"RSS попередження/помилка для {url}: {feed.bozo_exception}")
+            if not feed.entries:
+                continue
+            entries.extend(feed.entries)
+        except Exception as e:
+            log.error(f"Помилка читання RSS {url}: {e}")
 
-def send_telegram(text: str):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    data = {"chat_id": CHANNEL_ID, "text": text, "parse_mode": "HTML"}
-    r = requests.post(url, data=data, timeout=15); r.raise_for_status()
+    # Сортуємо за датою публікації, якщо вона є
+    def sort_key(e):
+        return e.get("published_parsed") or e.get("updated_parsed") or 0
 
-def fetch_and_post(limit_per_feed: int = 5) -> int:
-    posted = 0
-    for rss in RSS_URLS:
-        feed = feedparser.parse(rss)
-        for e in feed.entries[:limit_per_feed]:
-            title = (e.get("title") or "").strip()
-            link  = (e.get("link")  or "").strip()
-            if not title or not link: continue
-            key = h(link)
-            if key in seen: continue
-            ua = translate_uk(title)
-            text = f"<b>{html.escape(ua)}</b>\n{html.escape(link)}"
-            send_telegram(text)
-            seen.add(key); posted += 1; time.sleep(1)
-    log(f"posted {posted} items"); return posted
+    entries.sort(key=sort_key, reverse=True)
+    return entries[:max_items]
 
-@app.api_route("/", methods=["GET","HEAD"])
-def root(): return {"ok": True}
+def extract_image_url(entry):
+    """Намагається дістати URL зображення з RSS-запису (media_content, enclosure тощо)."""
+    # 1) media_content
+    media = getattr(entry, "media_content", None)
+    if media and isinstance(media, list):
+        for m in media:
+            url = m.get("url")
+            if url:
+                return url
 
-@app.api_route("/run", methods=["GET","HEAD"])
-def run():
+    # 2) links з type image/*
+    for l in entry.get("links", []):
+        if l.get("type", "").startswith("image/") and l.get("href"):
+            return l["href"]
+
+    # 3) media_thumbnail
+    thumbs = getattr(entry, "media_thumbnail", None)
+    if thumbs and isinstance(thumbs, list):
+        for t in thumbs:
+            url = t.get("url")
+            if url:
+                return url
+
+    return None
+
+def translate_title(title):
+    """Переклад на українську з fallback на оригінал."""
     try:
-        n = fetch_and_post()
-        return {"status":"ok","posted":n}
+        return translator.translate(title, dest="uk").text
     except Exception as e:
-        log("run error:", e)
-        return {"status":"error","detail":str(e)}
+        log.warning(f"Переклад не вдався: {e}")
+        return title
+
+def post_item(title, link, image_url=None):
+    """Надсилає один пост у канал: заголовок (укр) + посилання, опційно картинка."""
+    title_uk = translate_title(title)
+    caption = f"📰 {title_uk}\n🔗 Джерело: {link}"
+
+    try:
+        if image_url:
+            bot.send_photo(CHANNEL_USERNAME, image_url, caption=caption)
+        else:
+            bot.send_message(CHANNEL_USERNAME, caption, disable_web_page_preview=False)
+        log.info(f"Опубліковано: {title_uk}")
+        return True
+    except Exception as e:
+        log.error(f"Помилка надсилання в Telegram: {e}")
+        return False
+
+# =========================
+#     ОСНОВНА ЛОГІКА
+# =========================
+def post_news_batch():
+    """Кожні 2 години публікує до BATCH_SIZE (3) новин без дублів."""
+    global POSTED
+    entries = fetch_entries_from_feeds(max_items=20)  # беремо запасом, відфільтруємо дублікати
+    if not entries:
+        log.info("RSS: новин не знайдено, спробуємо пізніше.")
+        return
+
+    sent = 0
+    for e in entries:
+        title = (e.get("title") or "").strip()
+        link = (e.get("link") or "").strip()
+        if not title or not link:
+            continue
+
+        if link in POSTED:
+            continue
+
+        img = extract_image_url(e)
+        if post_item(title, link, image_url=img):
+            POSTED.add(link)
+            save_history(POSTED)
+            sent += 1
+
+        if sent >= BATCH_SIZE:
+            break
+
+    if sent == 0:
+        log.info("Немає нових новин для публікації (усе вже постили).")
+
+# =========================
+#     FLASK (Render keep-alive)
+# =========================
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return "Stock News UA bot is running!"
+
+def run_flask():
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, threaded=True)
+
+# =========================
+#     ГОЛОВНИЙ ЦИКЛ
+# =========================
+def main_loop():
+    log.info("Бот запущений. Кожні 2 години публікує 3 новини.")
+    # перша спроба одразу після старту
+    try:
+        post_news_batch()
+    except Exception as e:
+        log.error(f"Помилка першої публікації: {e}")
+
+    while True:
+        time.sleep(7200)  # 2 години
+        try:
+            post_news_batch()
+        except Exception as e:
+            log.error(f"Помилка у циклі: {e}")
+
+if __name__ == "__main__":
+    threading.Thread(target=run_flask, daemon=True).start()
+    main_loop()
