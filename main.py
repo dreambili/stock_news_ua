@@ -6,9 +6,9 @@ import feedparser
 import requests
 from flask import Flask, jsonify
 
-# ====== ENV ======
+# ==== ENV ====
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()  # @your_channel або -100XXXXXXXXXX
+CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()  # @channel або -100XXXXXXXXXX
 TRANSLATE_API_URL = os.getenv("TRANSLATE_API_URL", "").strip()  # напр.: https://translate.astian.org/translate
 
 DEFAULT_FEEDS = [
@@ -18,13 +18,13 @@ DEFAULT_FEEDS = [
 ]
 FEEDS = [x.strip() for x in os.getenv("SOURCE_FEEDS", ",".join(DEFAULT_FEEDS)).split(",") if x.strip()]
 
-# Локальні файли стану
+# Файли локального стану (переживуть «сон» інстансу, але не повний redeploy)
 LAST_RUN_FILE = "last_run.json"
 POSTED_FILE = "posted_ids.json"
 
 app = Flask(__name__)
 
-# ====== helper ======
+# ==== helpers ====
 def _load_json(path: str, default):
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -44,7 +44,7 @@ def _hash(s: str) -> str:
 
 def should_run_every_2h() -> bool:
     last = float(_load_json(LAST_RUN_FILE, {"last": 0}).get("last", 0))
-    return (_now_ts() - last) >= 2 * 60 * 60  # 2 години
+    return (_now_ts() - last) >= 2 * 60 * 60
 
 def mark_ran_now():
     _save_json(LAST_RUN_FILE, {"last": _now_ts()})
@@ -58,24 +58,40 @@ def remember_posted(ids: List[str], keep: int = 600):
     s = s[-keep:]
     _save_json(POSTED_FILE, {"ids": s})
 
+# ---- переклад EN->UK з фолбеком ----
 def translate_to_uk(text: str) -> str:
-    """Опційний переклад через зовнішній API. Якщо недоступний — повертає оригінал."""
-    if not TRANSLATE_API_URL or not text:
+    if not text:
         return text
-    try:
-        r = requests.post(
-            TRANSLATE_API_URL,
-            json={"q": text, "source": "en", "target": "uk", "format": "text"},
-            timeout=12,
-        )
-        if r.ok:
-            j = r.json()
-            return j.get("translatedText") or text
-    except Exception:
-        pass
-    return text
 
-def fetch_articles(feeds: List[str], limit: int = 80) -> List[Dict]:
+    def _call(url: str) -> str | None:
+        try:
+            r = requests.post(
+                url,
+                json={"q": text, "source": "en", "target": "uk", "format": "text"},
+                timeout=12,
+                headers={"Accept": "application/json"},
+            )
+            if r.ok:
+                j = r.json()
+                t = j.get("translatedText")
+                if isinstance(t, str) and t.strip():
+                    return t
+        except Exception:
+            pass
+        return None
+
+    api = TRANSLATE_API_URL
+    if api:
+        out = _call(api)
+        if out:
+            return out
+
+    # Публічний фолбек, якщо твій endpoint недоступний
+    out = _call("https://libretranslate.de/translate")
+    return out or text
+
+# ---- RSS ----
+def fetch_articles(feeds: List[str], limit: int = 100) -> List[Dict]:
     items, seen = [], set()
     for url in feeds:
         try:
@@ -97,6 +113,7 @@ def fetch_articles(feeds: List[str], limit: int = 80) -> List[Dict]:
             break
     return items
 
+# ---- Telegram ----
 def send_to_telegram(text: str):
     if not BOT_TOKEN or not CHANNEL_ID:
         raise RuntimeError("BOT_TOKEN або CHANNEL_ID не задані в Environment")
@@ -105,7 +122,7 @@ def send_to_telegram(text: str):
         "chat_id": CHANNEL_ID,
         "text": text,
         "parse_mode": "HTML",
-        "disable_web_page_preview": False,  # <- дозволяємо прев'ю (картку)
+        "disable_web_page_preview": False,  # картка-прев'ю УВІМКНЕНА
     }
     r = requests.post(url, json=payload, timeout=15)
     r.raise_for_status()
@@ -113,22 +130,31 @@ def send_to_telegram(text: str):
 def compose_message(item: Dict) -> str:
     title_uk = translate_to_uk(item["title"])
     link = item["link"]
-    # Формат як у твоєму прикладі: 1-й рядок заголовок UA, 2-й – посилання
+    # Формат: 1-й рядок — заголовок УКР, 2-й — лінк
     return f"{title_uk}\n{link}" if link else title_uk
 
-# ====== routes ======
+# ==== routes ====
 @app.get("/")
 def health():
     return jsonify({"ok": True})
 
+@app.get("/diag")
+def diag():
+    return jsonify({
+        "feeds": FEEDS,
+        "has_translate_url": bool(TRANSLATE_API_URL),
+        "last_run": _load_json(LAST_RUN_FILE, {"last": 0}).get("last", 0),
+        "posted_count": len(get_posted_set()),
+    })
+
 @app.get("/run")
 def run_job():
-    # 1) Частота: не частіше, ніж раз на 2 години
+    # 1) Обмеження частоти
     if not should_run_every_2h():
         return jsonify({"status": "skip", "reason": "less than 2h since last run"})
 
     # 2) Збір новин
-    items = fetch_articles(FEEDS, limit=100)
+    items = fetch_articles(FEEDS, limit=120)
     posted = get_posted_set()
 
     to_post, new_ids = [], []
@@ -144,7 +170,7 @@ def run_job():
         mark_ran_now()
         return jsonify({"status": "ok", "posted": 0, "note": "no new items"})
 
-    # 3) Відправка в Telegram
+    # 3) Відправка
     sent = 0
     for it in to_post:
         try:
@@ -154,7 +180,7 @@ def run_job():
         except Exception:
             pass
 
-    # 4) Зберегти стан та мітку часу
+    # 4) Стан
     if sent:
         remember_posted(new_ids[:sent])
     mark_ran_now()
