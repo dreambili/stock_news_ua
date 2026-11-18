@@ -3,6 +3,7 @@ from fastapi import FastAPI
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
+MYMEMORY_EMAIL = os.getenv("MYMEMORY_EMAIL", "")  # з email ліміт MyMemory 50 000 символів/день
 
 RSS_URLS = [
     "https://finance.yahoo.com/rss/headline?s=%5EGSPC",  # S&P 500
@@ -17,37 +18,48 @@ seen = set()
 def log(*a): print(*a, file=sys.stdout, flush=True)
 def h(s: str) -> str: return hashlib.sha1(s.encode()).hexdigest()
 
-def lt_translate(text: str) -> str:
-    r = requests.post(LT_URL, timeout=12,
-        json={"q": text, "source": "en", "target": "uk", "format": "text"})
-    r.raise_for_status()
-    return r.json().get("translatedText") or text
+def _changed(src: str, out: str) -> bool:
+    return bool(out) and out.strip().lower() != src.strip().lower()
 
-def mymemory_translate(text: str) -> str:
+def google_translate(text: str) -> str:
     r = requests.get(
-        "https://api.mymemory.translated.net/get",
-        params={"q": text, "langpair": "en|uk"},
-        timeout=10
+        "https://translate.googleapis.com/translate_a/single",
+        params={"client": "gtx", "sl": "en", "tl": "uk", "dt": "t", "q": text},
+        timeout=10,
     )
     r.raise_for_status()
+    return "".join(part[0] for part in r.json()[0] if part and part[0])
+
+def mymemory_translate(text: str) -> str:
+    params = {"q": text[:500], "langpair": "en|uk"}
+    if MYMEMORY_EMAIL:
+        params["de"] = MYMEMORY_EMAIL
+    r = requests.get("https://api.mymemory.translated.net/get", params=params, timeout=10)
+    r.raise_for_status()
     data = r.json()
-    return (data.get("responseData") or {}).get("translatedText") or text
+    if data.get("responseStatus") not in (200, "200"):
+        raise RuntimeError(data.get("responseDetails"))
+    return (data.get("responseData") or {}).get("translatedText") or ""
+
+def lt_translate(text: str) -> str:
+    # таймаут 70 с: free-інстанс Render прокидається до ~50 с
+    r = requests.post(LT_URL, timeout=70,
+        json={"q": text, "source": "en", "target": "uk", "format": "text"})
+    r.raise_for_status()
+    return r.json().get("translatedText") or ""
 
 def translate_uk(text: str) -> str:
-    try:
-        t = lt_translate(text)
-        if t and t.strip().lower() != text.strip().lower():
-            return t
-        # якщо LibreTranslate повернув оригінал, пробуємо fallback
-        raise RuntimeError("LT returned original")
-    except Exception as e:
-        log("LT fail:", e)
+    for name, fn in (("Google", google_translate),
+                     ("MyMemory", mymemory_translate),
+                     ("LT", lt_translate)):
         try:
-            t2 = mymemory_translate(text)
-            return t2 or text
-        except Exception as e2:
-            log("MyMemory fail:", e2)
-            return text
+            t = fn(text)
+            if _changed(text, t):
+                return t
+            log(f"{name} returned original")
+        except Exception as e:
+            log(f"{name} fail:", e)
+    return text
 
 def send_telegram(text: str):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -64,14 +76,21 @@ def fetch_and_post(limit_per_feed: int = 5) -> int:
             if not title or not link: continue
             key = h(link)
             if key in seen: continue
-            ua = translate_uk(title)
-            text = f"<b>{html.escape(ua)}</b>\n{html.escape(link)}"
-            send_telegram(text)
-            seen.add(key); posted += 1; time.sleep(1)
+            try:
+                ua = translate_uk(title)
+                text = f"<b>{html.escape(ua)}</b>\n{html.escape(link)}"
+                send_telegram(text)
+                seen.add(key); posted += 1; time.sleep(1)
+            except Exception as ex:
+                log("post fail:", ex)
     log(f"posted {posted} items"); return posted
 
 @app.api_route("/", methods=["GET","HEAD"])
 def root(): return {"ok": True}
+
+@app.api_route("/test-translate", methods=["GET"])
+def test_translate(q: str = "Microsoft shares rise on strong cloud growth"):
+    return {"src": q, "uk": translate_uk(q)}
 
 @app.api_route("/run", methods=["GET","HEAD"])
 def run():
