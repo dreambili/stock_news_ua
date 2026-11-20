@@ -3,6 +3,7 @@ from fastapi import FastAPI
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
+DEEPL_API_KEY = os.getenv("DEEPL_API_KEY", "")   # DeepL API Free, ключ закінчується на :fx
 MYMEMORY_EMAIL = os.getenv("MYMEMORY_EMAIL", "")  # з email ліміт MyMemory 50 000 символів/день
 LT_URL = os.getenv("TRANSLATE_API_URL", "")       # свій LibreTranslate, якщо є (публічний astian мертвий)
 # 1 = публікувати англійською, якщо всі перекладачі впали; 0 = пропустити і спробувати на наступному /run
@@ -24,6 +25,17 @@ def h(s: str) -> str: return hashlib.sha1(s.encode()).hexdigest()
 
 def _changed(src: str, out: str) -> bool:
     return bool(out) and out.strip().lower() != src.strip().lower()
+
+def deepl_translate(text: str) -> str:
+    if not DEEPL_API_KEY:
+        raise RuntimeError("DEEPL_API_KEY не задано")
+    host = "api-free.deepl.com" if DEEPL_API_KEY.endswith(":fx") else "api.deepl.com"
+    r = requests.post(f"https://{host}/v2/translate",
+                      headers={"Authorization": f"DeepL-Auth-Key {DEEPL_API_KEY}"},
+                      json={"text": [text], "source_lang": "EN", "target_lang": "UK"},
+                      timeout=15)
+    r.raise_for_status()
+    return r.json()["translations"][0]["text"]
 
 def google_translate(text: str) -> str:
     r = requests.get(
@@ -70,7 +82,8 @@ def lt_translate(text: str) -> str:
     r.raise_for_status()
     return r.json().get("translatedText") or ""
 
-PROVIDERS = (("Google", google_translate),
+PROVIDERS = (("DeepL", deepl_translate),
+             ("Google", google_translate),
              ("Google2", google2_translate),
              ("MyMemory", mymemory_translate),
              ("LT", lt_translate))
