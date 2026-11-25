@@ -217,44 +217,95 @@ def edit_telegram(msg_id: int, text: str):
     tg("editMessageText", {"chat_id": CHANNEL_ID, "message_id": msg_id, "text": text,
                            "parse_mode": "HTML", "link_preview_options": {"is_disabled": True}})
 
-def fetch_and_post(limit_per_feed: int = 5) -> dict:
-    posted = skipped = confirmed = 0
+# ---------- Антиспам: публікуємо лише важливе ----------
+MIN_SCORE = int(os.getenv("MIN_SCORE", "3"))                  # поріг важливості
+MAX_POSTS_PER_RUN = int(os.getenv("MAX_POSTS_PER_RUN", "3"))  # максимум нових постів за один /run
+MAX_AGE_HOURS = float(os.getenv("MAX_AGE_HOURS", "3"))        # старші новини ігноруються (і дублі після рестарту)
+BLOCKED_SOURCES = {s.strip().lower() for s in
+                   os.getenv("BLOCKED_SOURCES", "Motley Fool,Zacks,InvestorPlace,24/7 Wall St.,GuruFocus").split(",")}
+
+HOT = re.compile(r"\b(surge[sd]?|soar(s|ed)?|plunge[sd]?|tumble[sd]?|crash(es|ed)?|sink(s)?|sank|skyrocket|"
+                 r"record|all-time high|beats?|miss(es|ed)?|tops? estimates|guidance|outlook|"
+                 r"acquir(e|es|ed|ition)|merger|buyout|takeover|deal to buy|stake|"
+                 r"ceo|resign(s|ed)?|steps? down|fired|layoffs?|job cuts|"
+                 r"lawsuit|sues?|probe|investigation|sec|doj|antitrust|fine[sd]?|ban(s|ned)?|tariffs?|"
+                 r"fda|approv(al|es|ed)|recall|bankrupt(cy)?|default|"
+                 r"upgrade[sd]?|downgrade[sd]?|price target|split|buyback|dividend cut|"
+                 r"fed|powell|rate (cut|hike)|cpi|inflation|jobs report|payrolls|gdp|recession|"
+                 r"halt(ed)?|breaking|exclusive)\b", re.I)
+JUNK = re.compile(r"(\?|\bstocks? to (buy|watch|own)\b|\bshould you\b|\bhere'?s (why|what|how)\b|"
+                  r"\bis it (time|too late)\b|\bbest\b|\btop \d+\b|^\d+ |\bmillionaire\b|\bprediction\b|"
+                  r"\bcould\b|\bmight\b|\bwhat to (know|expect|watch)\b|\bmorning brief\b|\bpodcast\b|"
+                  r"\bvideo\b|\bopinion\b|\bpassive income\b|\bretire(ment)?\b|\bbuy (now|and hold)\b|"
+                  r"\bforever\b|\bno-brainer\b|\bbargain\b|\bsmartest\b)", re.I)
+PCT = re.compile(r"\d+(\.\d+)?\s?%")
+
+def score(title_en: str, ticker, src: str) -> int:
+    if src.lower() in BLOCKED_SOURCES:
+        return -99
+    s = 0
+    if ticker: s += 2
+    s += 2 * min(len(HOT.findall(title_en)), 2)
+    if PCT.search(title_en): s += 1
+    if JUNK.search(title_en): s -= 4
+    return s
+
+def age_hours(entry):
+    t = entry.get("published_parsed") or entry.get("updated_parsed")
+    return (time.time() - time.mktime(t) + time.timezone) / 3600 if t else 0.0
+
+def candidates(limit_per_feed: int):
+    """Усі нові новини зі всіх стрічок з оцінкою, без дублів посилань."""
+    out, links = [], set()
     for rss in RSS_URLS:
-        feed = feedparser.parse(rss)
-        for e in feed.entries[:limit_per_feed]:
-            title = (e.get("title") or "").strip()
-            link = (e.get("link") or "").strip()
-            if not title or not link: continue
-            key = h(link)
-            if key in seen: continue
-            try:
-                ticker = find_ticker(title)
-                src_name = source_name(e, link)
-                ws = words(title)
+        for e in feedparser.parse(rss).entries[:limit_per_feed]:
+            title, link = (e.get("title") or "").strip(), (e.get("link") or "").strip()
+            if not title or not link or link in links: continue
+            links.add(link)
+            ticker, src_name = find_ticker(title), source_name(e, link)
+            out.append({"e": e, "title": title, "link": link, "key": h(link), "ticker": ticker,
+                        "src": src_name, "score": score(title, ticker, src_name), "age": age_hours(e)})
+    return out
 
-                orig = find_original(ws, ticker, src_name)
-                if orig:  # та сама новина від іншого джерела -> "Підтвердили"
-                    orig["confirmed"].append((src_name, link))
-                    edit_telegram(orig["msg_id"], build_post(orig["ua"], orig["ticker"], orig["src"],
-                                                             orig["link"], orig["tags"], orig["confirmed"]))
-                    seen.add(key); confirmed += 1; time.sleep(1)
+def fetch_and_post(limit_per_feed: int = 20) -> dict:
+    posted = skipped = confirmed = filtered = 0
+    fresh = []
+    for c in candidates(limit_per_feed):
+        if c["key"] in seen: continue
+        if c["age"] > MAX_AGE_HOURS or c["score"] < MIN_SCORE:
+            seen.add(c["key"]); filtered += 1          # нецікаве/старе — більше не розглядаємо
+            continue
+        fresh.append(c)
+    fresh.sort(key=lambda c: (-c["score"], c["age"]))
+
+    for c in fresh:
+        try:
+            ws = words(c["title"])
+            orig = find_original(ws, c["ticker"], c["src"])
+            if orig:  # та сама новина від іншого джерела -> "Підтвердили" (не рахується в ліміт)
+                orig["confirmed"].append((c["src"], c["link"]))
+                edit_telegram(orig["msg_id"], build_post(orig["ua"], orig["ticker"], orig["src"],
+                                                         orig["link"], orig["tags"], orig["confirmed"]))
+                seen.add(c["key"]); confirmed += 1; time.sleep(1)
+                continue
+            if posted >= MAX_POSTS_PER_RUN:
+                continue                                # лишаємо на наступний /run, поки свіже
+            ua = translate_uk(c["title"])
+            if ua is None:
+                if not POST_UNTRANSLATED:
+                    skipped += 1
                     continue
-
-                ua = translate_uk(title)
-                if ua is None:
-                    if not POST_UNTRANSLATED:
-                        skipped += 1          # не додаємо в seen — спробуємо наступного разу
-                        continue
-                    ua = title
-                tags = hashtags(title, ticker)
-                msg_id = send_telegram(build_post(ua, ticker, src_name, link, tags))
-                recent.append({"msg_id": msg_id, "ts": time.time(), "words": ws, "ticker": ticker,
-                               "src": src_name, "link": link, "ua": ua, "tags": tags, "confirmed": []})
-                seen.add(key); posted += 1; time.sleep(1)
-            except Exception as ex:
-                log("post fail:", ex)
-    log(f"posted {posted}, confirmed {confirmed}, skipped (no translation) {skipped}")
-    return {"posted": posted, "confirmed": confirmed, "skipped_untranslated": skipped}
+                ua = c["title"]
+            tags = hashtags(c["title"], c["ticker"])
+            msg_id = send_telegram(build_post(ua, c["ticker"], c["src"], c["link"], tags))
+            recent.append({"msg_id": msg_id, "ts": time.time(), "words": ws, "ticker": c["ticker"],
+                           "src": c["src"], "link": c["link"], "ua": ua, "tags": tags, "confirmed": []})
+            seen.add(c["key"]); posted += 1; time.sleep(1)
+        except Exception as ex:
+            log("post fail:", ex)
+    log(f"posted {posted}, confirmed {confirmed}, filtered {filtered}, skipped (no translation) {skipped}")
+    return {"posted": posted, "confirmed": confirmed, "filtered_out": filtered,
+            "skipped_untranslated": skipped}
 
 @app.api_route("/", methods=["GET", "HEAD"])
 def root(): return {"ok": True}
@@ -266,16 +317,16 @@ def test_translate(q: str = "Microsoft shares rise on strong cloud growth"):
     return {"src": q, "uk": uk, "providers": report}
 
 @app.api_route("/preview", methods=["GET"])
-def preview(limit: int = 5):
-    """Показує, як виглядатимуть пости, нічого не відправляючи і не перекладаючи."""
-    out = []
-    for rss in RSS_URLS:
-        for e in feedparser.parse(rss).entries[:limit]:
-            title, link = (e.get("title") or "").strip(), (e.get("link") or "").strip()
-            if title and link:
-                t = find_ticker(title)
-                out.append(build_post(title, t, source_name(e, link), link, hashtags(title, t)))
-    return {"posts": out}
+def preview(limit: int = 20):
+    """Що пройде фільтр, а що ні (з оцінкою). Нічого не відправляє і не перекладає."""
+    rows = []
+    for c in sorted(candidates(limit), key=lambda c: -c["score"]):
+        ok = c["score"] >= MIN_SCORE and c["age"] <= MAX_AGE_HOURS
+        rows.append({"pass": ok, "score": c["score"], "age_h": round(c["age"], 1), "src": c["src"],
+                     "post": build_post(c["title"], c["ticker"], c["src"], c["link"],
+                                        hashtags(c["title"], c["ticker"]))})
+    return {"min_score": MIN_SCORE, "max_posts_per_run": MAX_POSTS_PER_RUN,
+            "max_age_hours": MAX_AGE_HOURS, "items": rows}
 
 @app.api_route("/run", methods=["GET", "HEAD"])
 def run():
