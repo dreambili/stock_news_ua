@@ -174,12 +174,23 @@ def hashtags(title_en: str, ticker) -> str:
 def a(text: str, url: str) -> str:
     return f'<a href="{html.escape(url, quote=True)}">{html.escape(text)}</a>'
 
-def build_post(title_ua: str, ticker, src: str, link: str, tags: str, confirmed=()) -> str:
-    head = f"${ticker} - {title_ua}" if ticker else title_ua
-    text = f"<b>{html.escape(head)}</b> - {a(src, link)} 💎 {tags}"
+UP = re.compile(r"\b(rise[sd]?|rising|gain(s|ed)?|jump(s|ed)?|surge[sd]?|soar(s|ed)?|rall(y|ies|ied)|"
+                r"climb(s|ed)?|up \d|higher|record high|beats?|tops?|upgrade[sd]?|boost(s|ed)?|rebound(s|ed)?)\b", re.I)
+DOWN = re.compile(r"\b(fall(s|ing)?|fell|drop(s|ped)?|slide[sd]?|slip(s|ped)?|sink(s)?|sank|plunge[sd]?|"
+                  r"tumble[sd]?|crash(es|ed)?|slump(s|ed)?|lower|down \d|miss(es|ed)?|downgrade[sd]?|"
+                  r"cut(s)?|sell-?off|loss(es)?|warn(s|ed|ing)?|decline[sd]?)\b", re.I)
+
+def mood(title_en: str) -> str:
+    up, down = len(UP.findall(title_en)), len(DOWN.findall(title_en))
+    return "🟢" if up > down else "🔴" if down > up else "⚪️"
+
+def build_post(title_ua: str, ticker, src: str, link: str, tags: str, confirmed=(), mood_icon="⚪️") -> str:
+    head = f"{mood_icon} <b>${html.escape(ticker)}</b>" if ticker else f"{mood_icon} <b>Ринок</b>"
+    lines = [head, "", f"<b>{html.escape(title_ua)}</b>", "", f"📎 {a(src, link)}"]
     if confirmed:
-        text += "\n\nПідтвердили: " + ", ".join(a(n, u) for n, u in confirmed)
-    return text
+        lines.append("✅ Підтвердили: " + ", ".join(a(n, u) for n, u in confirmed))
+    lines += ["", tags]
+    return "\n".join(lines)
 
 # ---------- "Підтвердили": схожа новина від іншого джерела ----------
 STOP = set("the a an of to in on for and or with as at by from is are be after over amid its it "
@@ -237,7 +248,9 @@ JUNK = re.compile(r"(\?|\bstocks? to (buy|watch|own)\b|\bshould you\b|\bhere'?s 
                   r"\bis it (time|too late)\b|\bbest\b|\btop \d+\b|^\d+ |\bmillionaire\b|\bprediction\b|"
                   r"\bcould\b|\bmight\b|\bwhat to (know|expect|watch)\b|\bmorning brief\b|\bpodcast\b|"
                   r"\bvideo\b|\bopinion\b|\bpassive income\b|\bretire(ment)?\b|\bbuy (now|and hold)\b|"
-                  r"\bforever\b|\bno-brainer\b|\bbargain\b|\bsmartest\b)", re.I)
+                  r"\bforever\b|\bno-brainer\b|\bbargain\b|\bsmartest\b|\bpreview\b|\brecap\b|"
+                  r"\bwrap(-up)?\b|\broundup\b|\blive( updates)?\b|\bstock market today\b|\bwhat'?s moving\b|"
+                  r"\bwhy .* (fell|rose|dropped|jumped|soared|plunged|is (up|down))\b)", re.I)
 PCT = re.compile(r"\d+(\.\d+)?\s?%")
 
 def score(title_en: str, ticker, src: str) -> int:
@@ -285,7 +298,8 @@ def fetch_and_post(limit_per_feed: int = 20) -> dict:
             if orig:  # та сама новина від іншого джерела -> "Підтвердили" (не рахується в ліміт)
                 orig["confirmed"].append((c["src"], c["link"]))
                 edit_telegram(orig["msg_id"], build_post(orig["ua"], orig["ticker"], orig["src"],
-                                                         orig["link"], orig["tags"], orig["confirmed"]))
+                                                         orig["link"], orig["tags"], orig["confirmed"],
+                                                         orig["mood"]))
                 seen.add(c["key"]); confirmed += 1; time.sleep(1)
                 continue
             if posted >= MAX_POSTS_PER_RUN:
@@ -297,8 +311,9 @@ def fetch_and_post(limit_per_feed: int = 20) -> dict:
                     continue
                 ua = c["title"]
             tags = hashtags(c["title"], c["ticker"])
-            msg_id = send_telegram(build_post(ua, c["ticker"], c["src"], c["link"], tags))
-            recent.append({"msg_id": msg_id, "ts": time.time(), "words": ws, "ticker": c["ticker"],
+            m = mood(c["title"])
+            msg_id = send_telegram(build_post(ua, c["ticker"], c["src"], c["link"], tags, mood_icon=m))
+            recent.append({"msg_id": msg_id, "mood": m, "ts": time.time(), "words": ws, "ticker": c["ticker"],
                            "src": c["src"], "link": c["link"], "ua": ua, "tags": tags, "confirmed": []})
             seen.add(c["key"]); posted += 1; time.sleep(1)
         except Exception as ex:
