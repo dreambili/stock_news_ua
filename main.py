@@ -174,6 +174,44 @@ def hashtags(title_en: str, ticker) -> str:
 def a(text: str, url: str) -> str:
     return f'<a href="{html.escape(url, quote=True)}">{html.escape(text)}</a>'
 
+# ---------- Уривок статті ----------
+SNIPPET_CHARS = int(os.getenv("SNIPPET_CHARS", "500"))   # 0 = вимкнути уривки
+
+def _clean(s: str) -> str:
+    s = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", s or "", flags=re.S | re.I)
+    s = html.unescape(re.sub(r"<[^>]+>", " ", s))
+    return re.sub(r"\s+", " ", s).strip()
+
+def _cut(s: str, n: int) -> str:
+    if len(s) <= n: return s
+    s = s[:n]
+    end = max(s.rfind(". "), s.rfind("! "), s.rfind("? "))
+    return s[:end + 1] if end > n * 0.4 else s.rsplit(" ", 1)[0] + "…"
+
+_META = re.compile(r'<meta[^>]+(?:property|name)=["\'](?:og:description|description|twitter:description)["\']'
+                   r'[^>]+content=["\']([^"\']{40,})["\']', re.I)
+_META2 = re.compile(r'<meta[^>]+content=["\']([^"\']{40,})["\'][^>]+(?:property|name)=["\']'
+                    r'(?:og:description|description)["\']', re.I)
+_PARA = re.compile(r"<p[^>]*>(.*?)</p>", re.S | re.I)
+
+def get_snippet(entry, link: str, title: str) -> str:
+    if SNIPPET_CHARS <= 0: return ""
+    t = title.lower()[:40]
+    def good(s): return len(s) >= 60 and t not in s.lower()[:60]
+    s = _clean(entry.get("summary") or entry.get("description") or "")
+    if good(s): return _cut(s, SNIPPET_CHARS)
+    try:
+        r = requests.get(link, headers=UA, timeout=10)
+        page = r.text
+    except Exception as ex:
+        log("snippet fetch fail:", ex); return ""
+    paras = [p for p in (_clean(x) for x in _PARA.findall(page)) if len(p) > 80 and "cookie" not in p.lower()]
+    text = " ".join(paras[:3])
+    if good(text): return _cut(text, SNIPPET_CHARS)
+    m = _META.search(page) or _META2.search(page)
+    s = _clean(m.group(1)) if m else ""
+    return _cut(s, SNIPPET_CHARS) if good(s) else ""
+
 UP = re.compile(r"\b(rise[sd]?|rising|gain(s|ed)?|jump(s|ed)?|surge[sd]?|soar(s|ed)?|rall(y|ies|ied)|"
                 r"climb(s|ed)?|up \d|higher|record high|beats?|tops?|upgrade[sd]?|boost(s|ed)?|rebound(s|ed)?)\b", re.I)
 DOWN = re.compile(r"\b(fall(s|ing)?|fell|drop(s|ped)?|slide[sd]?|slip(s|ped)?|sink(s)?|sank|plunge[sd]?|"
@@ -184,9 +222,13 @@ def mood(title_en: str) -> str:
     up, down = len(UP.findall(title_en)), len(DOWN.findall(title_en))
     return "🟢" if up > down else "🔴" if down > up else "⚪️"
 
-def build_post(title_ua: str, ticker, src: str, link: str, tags: str, confirmed=(), mood_icon="⚪️") -> str:
+def build_post(title_ua: str, ticker, src: str, link: str, tags: str, confirmed=(), mood_icon="⚪️",
+               snippet: str = "") -> str:
     head = f"{mood_icon} <b>${html.escape(ticker)}</b>" if ticker else f"{mood_icon} <b>Ринок</b>"
-    lines = [head, "", f"<b>{html.escape(title_ua)}</b>", "", f"📎 {a(src, link)}"]
+    lines = [head, "", f"<b>{html.escape(title_ua)}</b>", ""]
+    if snippet:
+        lines += [f"<blockquote expandable>{html.escape(snippet)}</blockquote>", ""]
+    lines.append(f"📎 {a(src, link)}")
     if confirmed:
         lines.append("✅ Підтвердили: " + ", ".join(a(n, u) for n, u in confirmed))
     lines += ["", tags]
@@ -299,7 +341,7 @@ def fetch_and_post(limit_per_feed: int = 20) -> dict:
                 orig["confirmed"].append((c["src"], c["link"]))
                 edit_telegram(orig["msg_id"], build_post(orig["ua"], orig["ticker"], orig["src"],
                                                          orig["link"], orig["tags"], orig["confirmed"],
-                                                         orig["mood"]))
+                                                         orig["mood"], orig.get("snippet", "")))
                 seen.add(c["key"]); confirmed += 1; time.sleep(1)
                 continue
             if posted >= MAX_POSTS_PER_RUN:
@@ -312,8 +354,11 @@ def fetch_and_post(limit_per_feed: int = 20) -> dict:
                 ua = c["title"]
             tags = hashtags(c["title"], c["ticker"])
             m = mood(c["title"])
-            msg_id = send_telegram(build_post(ua, c["ticker"], c["src"], c["link"], tags, mood_icon=m))
-            recent.append({"msg_id": msg_id, "mood": m, "ts": time.time(), "words": ws, "ticker": c["ticker"],
+            snip_en = get_snippet(c["e"], c["link"], c["title"])
+            snip = (translate_uk(snip_en) or "") if snip_en else ""
+            msg_id = send_telegram(build_post(ua, c["ticker"], c["src"], c["link"], tags, mood_icon=m,
+                                              snippet=snip))
+            recent.append({"msg_id": msg_id, "mood": m, "snippet": snip, "ts": time.time(), "words": ws, "ticker": c["ticker"],
                            "src": c["src"], "link": c["link"], "ua": ua, "tags": tags, "confirmed": []})
             seen.add(c["key"]); posted += 1; time.sleep(1)
         except Exception as ex:
